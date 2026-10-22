@@ -442,6 +442,44 @@ def read_buildings(book):
     return result
 
 
+def resolve_building(value, buildings):
+    aliases = {}
+    for code, address in buildings.items():
+        name = re.split(r",?\s*\d", address, maxsplit=1)[0]
+        for alias in [code, address, name, name.replace("Большая ", "Б")]:
+            aliases[building_key(alias)] = address
+
+    result = []
+    for line in clean(value).split("\n"):
+        name = building_key(line)
+        address = aliases.get(name)
+        if address is None and len(name) >= 3:
+            # В строках встречаются Б.Покр / БПокр и Б.Печ / БПеч,
+            # хотя в легенде используются БПок и БП.
+            matches = {address for alias, address in aliases.items() if alias.startswith(name)}
+            if len(matches) == 1:
+                address = matches.pop()
+        result.append(address or line)
+    return "\n".join(result)
+
+
+def expand_building(lesson, buildings=None):
+    if buildings is None:
+        buildings = DEFAULT_BUILDINGS
+    result = dict(lesson)
+    before, mark, place = result["text"].rpartition("\nКорпус: ")
+    if mark:
+        result["building"] = resolve_building(place, buildings)
+        result["text"] = before + mark + result["building"]
+    elif result.get("building"):
+        result["building"] = resolve_building(result["building"], buildings)
+    return result
+
+
+def expand_plan_buildings(lessons, buildings=None):
+    return [expand_building(lesson, buildings) for lesson in lessons]
+
+
 def key(*parts):
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:20]
 
@@ -691,3 +729,356 @@ def en_rows(g, r, col, with_subject):
     return zip(groups, subjects, teachers, rooms, places)
 
 
+def skip_time(match):
+    # 11:10-12:30 — время, а 07.09-19.10 может быть периодом занятий.
+    if ":" in match[0] or int(match[2][-2:]) > 12:
+        return ""
+    return match[0]
+
+
+def swap_date(match):
+    return f"{int(match[2]):02}.{int(match[1]):02}"
+
+
+def date_text(text):
+    # В источниках встречаются латинское «c», пробел внутри даты и даты MM/DD.
+    text = re.sub(r"(?<=\d)\.\s+(?=\d{2}\b)", ".", text)
+    text = re.sub(r"(?<!\d)0\.(\d)/(\d{2})(?!\d)", r"0\1/\2", text)
+    text = re.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", swap_date, text)
+    text = re.sub(r"\bfrom\b", "с", text, flags=re.I)
+    text = re.sub(r"\bto\b", "по", text, flags=re.I)
+    return re.sub(r"\bc(?=\s+\d{1,2}\.)", "с", text, flags=re.I)
+
+
+def marked_days(text, year):
+    result = set()
+    for match in DATES.finditer(text):
+        result.add(as_date(match[1], year))
+    for span in SPAN.finditer(text):
+        day = as_date(span[1], year)
+        end = as_date(span[2], year)
+        while day <= end:
+            result.add(day)
+            day += timedelta(days=1)
+    return result
+
+
+def date_change(line):
+    # Дата изменения времени/места не ограничивает все остальные недели.
+    match = DATE_CHANGE.search(line)
+    if match and not line[match.end():].strip(" ,;:–—-()"):
+        return True
+    if not re.search(r"\b(?:в\s*\d|с\s*\d{1,2}:\d{2}|ауд|online|онлайн|корпус|вместо|перенос)", line, re.I):
+        return False
+    rest = DATES.sub("", line)
+    rest = TIME.sub("", rest)
+    return len(re.findall(r"[А-Яа-яA-Za-z]+", rest)) <= 4
+
+
+def date_rules(text, year):
+    # Сначала выделяем исключения, чтобы «с 09.09 ..., кроме 23.09» не потеряло начало.
+    text = date_text(text)
+    allowed = set()
+    denied = set()
+    restricted = False
+
+    for note in CANCEL_NOTE.finditer(text):
+        denied.update(marked_days(note[0], year))
+    text = CANCEL_NOTE.sub("", text)
+
+    for line in text.split("\n"):
+        if date_change(line):
+            continue
+        line = TIME.sub(skip_time, line)
+        marks = list(DATES.finditer(line))
+        if not marks:
+            continue
+        if re.search(CANCEL, line, re.I):
+            for match in marks:
+                denied.add(as_date(match[1], year))
+            continue
+
+        restricted = True
+        used = set()
+        for span in SPAN.finditer(line):
+            start = as_date(span[1], year)
+            end = as_date(span[2], year)
+            while start <= end:
+                allowed.add(start)
+                start += timedelta(days=1)
+            for i, match in enumerate(marks):
+                if span.start() <= match.start() < span.end():
+                    used.add(i)
+
+        for i, match in enumerate(marks):
+            if i in used:
+                continue
+            day = as_date(match[1], year)
+            before = line[:match.start()]
+            if re.search(r"\bс\s*$", before, re.I):
+                end = date(year + 1, 8, 31)
+                while day <= end:
+                    allowed.add(day)
+                    day += timedelta(days=1)
+            elif re.search(r"\b(?:до|по)\s*$", before, re.I):
+                start = date(year, 9, 1)
+                while start <= day:
+                    allowed.add(start)
+                    start += timedelta(days=1)
+            else:
+                allowed.add(day)
+    if not restricted:
+        allowed = None  # Даты не указаны — занятие каждую неделю.
+    return allowed, denied
+
+
+def clean_dates(text, day, year):
+    # Правила уже применены к занятию. В сообщении остаются только действующие строки.
+    result = []
+    for line in date_text(text).split("\n"):
+        has_dates = bool(DATES.search(line))
+        if not has_dates:
+            result.append(line.strip())
+            continue
+        allowed, _ = date_rules(line, year)
+        if allowed is not None and day not in allowed:
+            continue
+        line = CANCEL_NOTE.sub("", line)
+        # Убираем смену аудитории/времени вместе с датой, сохраняя имя преподавателя.
+        line = DATE_CHANGE.sub("", line)
+        line = re.sub(r"\b(?:с|со|до|по)\s+(?=" + STAMP + ")", "", line, flags=re.I)
+        line = re.sub(DATE_LIST, "", line, flags=re.I)
+        line = re.sub(r"\(\s*\)", "", line)
+        line = re.sub(r"\s+", " ", line).strip(" ,;:–—-()")
+        if line:
+            result.append(line)
+    return "\n".join(value for value in result if value)
+
+
+def base_location(text):
+    result = []
+    for line in text.split("\n"):
+        mark = DATES.search(date_text(line))
+        if mark:
+            line = date_text(line)[:mark.start()]
+        line = line.strip(" ,;:–—-()")
+        if line:
+            result.append(line)
+    return "\n".join(result)
+
+
+def lesson_location(room, place, index, count, day, year):
+    rooms = lines(room)
+    places = lines(place)
+    # В соседних ячейках строки соответствуют друг другу:
+    # «402 / 30.09 в 203» и «К / БПок». Второй корпус — часть замены.
+    paired = len(rooms) == len(places) and any(DATES.search(date_text(v)) for v in rooms)
+    if paired:
+        pairs = list(zip(rooms, places))
+        starts = [i for i, (value, _) in enumerate(pairs) if not DATES.search(date_text(value))]
+        if count > 1 and len(starts) == count:
+            end = starts[index + 1] if index + 1 < count else len(pairs)
+            pairs = pairs[starts[index]:end]
+        elif count > 1 and len(pairs) == count and not starts:
+            pairs = [pairs[index]]
+
+        base = []
+        changes = []
+        for room, place in pairs:
+            note = date_text(room)
+            if not DATES.search(note):
+                base.append((room, place))
+                continue
+            allowed, denied = date_rules(note, year)
+            if allowed is None:
+                allowed = marked_days(note, year)
+            if day in allowed and day not in denied:
+                changes.append((room, place))
+        selected = changes[-1:] or base
+        return "\n".join(v[0] for v in selected), "\n".join(v[1] for v in selected)
+
+    room = rooms[index] if len(rooms) == count else "\n".join(rooms)
+    place = places[index] if len(places) == count else "\n".join(places)
+    return room, place
+
+
+def parts(text):
+    # В одной ячейке могут быть разные предметы для разных дат.
+    result = []
+    for block in re.split(r"\n\s*\n+", text):
+        if not block.strip():
+            continue
+        note = re.match(r"^\s*" + STAMP + r"\s*(?:[-–—]\s*)?(?:отмен|отм\b|в\s)", block, re.I)
+        if result and note:
+            result[-1] += "\n" + block
+        else:
+            result.append(block.strip())
+    return result
+
+
+def on_day(row, day, year, weeks):
+    stamp = day.isoformat()
+    if day.weekday() != row["day"]:
+        return []
+    if not row["start"] <= stamp <= row["end"]:
+        return []
+    if row["mode"] != "all":
+        if stamp not in weeks:
+            raise ParseError(f"В календаре нет {day}")
+        if weeks[stamp] != row["mode"]:
+            return []
+
+    match = re.search(r"со?\s+(\d)\s*модул", row["text"], re.I)
+    if match:
+        month = date.fromisoformat(row["start"]).month
+        if 9 <= month <= 10:
+            current = 1
+        elif month >= 11:
+            current = 2
+        elif month <= 3:
+            current = 3
+        else:
+            current = 4
+        if int(match[1]) > current:
+            return []
+    if re.search(r"нечетным\s+недел", row["text"], re.I) and weeks.get(stamp) != "lower":
+        return []
+
+    chunks = parts(row["text"])
+    result = []
+    for i, text in enumerate(chunks):
+        allowed, denied = date_rules(text, year)
+        notes = "\n".join(row.get(field, "") for field in ["teacher", "group", "room", "place"])
+        _, extra_denied = date_rules(notes, year)
+        if day in denied or day in extra_denied:
+            continue
+        if allowed is not None and day not in allowed:
+            continue
+        outside = False
+        for field in ["teacher", "group"]:
+            dates, _ = date_rules(row.get(field, ""), year)
+            if dates is not None and day not in dates:
+                outside = True
+        if outside:
+            continue
+        room, place = lesson_location(
+            row.get("room", ""), row.get("place", ""), i, len(chunks), day, year,
+        )
+        time = row["time"]
+
+        # Проверяем примечания вроде «24.09. в 324 (Львовская)».
+        for note in [text, row.get("teacher", ""), room, place]:
+            for line in date_text(note).split("\n"):
+                dates = []
+                for mark in DATES.findall(line):
+                    dates.append(as_date(mark, year))
+                if day not in dates:
+                    continue
+                if re.search(r"\bonline\b|онлайн", line, re.I):
+                    room = ""
+                    place = "Онлайн"
+                new_time = TIME.search(line)
+                if new_time and re.search(r"\b[вс]\s*\d", line):
+                    time = new_time[0].replace(" ", "").replace("–", "-").replace("—", "-")
+                start_time = re.search(r"\b[вс]\s+(\d{1,2}:\d{2})(?!\s*[-–—])", line)
+                if start_time:
+                    start = start_time[1].zfill(5)
+                    duration = int(row["time"][6:8]) * 60 + int(row["time"][9:11])
+                    duration -= int(row["time"][:2]) * 60 + int(row["time"][3:5])
+                    end = int(start[:2]) * 60 + int(start[3:]) + duration
+                    time = f"{start}-{end // 60:02}:{end % 60:02}"
+                new_room = re.search(r"\bв\s+(?:ауд\.?\s*)?(\d+[А-Яа-я]?)", line)
+                if not new_room:
+                    new_room = re.search(STAMP + r"\s*[-–—]\s*(\d+[А-Яа-я]?)\s*\(", line)
+                if new_room and not new_time and not start_time:
+                    room = new_room[1]
+                    building = re.search(r"\(([^)]+)\)", line)
+                    if building:
+                        place = building[1]
+
+        info = [clean_dates(text, day, year)]
+        if row.get("teacher"):
+            info.append(clean_dates(row["teacher"], day, year))
+        room = base_location(room)
+        place = base_location(place)
+        if room:
+            info.append("Ауд.: " + room)
+        if place:
+            info.append("Корпус: " + place)
+        result.append({"date": stamp, "time": time, "text": "\n".join(value for value in info if value)})
+    return result
+
+
+def en_options(book, program, group, mode=None):
+    codes = set(CODES.get(program["name"], {group["code"]}))
+    codes.add(group["code"])
+    if group["code"] == "НДИЗ":
+        codes.add("ДИЗ")
+
+    faculties = {program["faculty"]}
+    for item in book["en"].values():
+        if item["course"] == group["course"] and item["code"] in codes:
+            faculties.add(item["faculty"])
+
+    result = []
+    for item in book["en"].values():
+        if item["course"] != group["course"]:
+            continue
+        if mode and item["mode"] != mode:
+            continue
+        if item["code"]:
+            if item["code"] not in codes:
+                continue
+        elif item["faculty"] not in faculties:
+            continue
+        result.append(item)
+    return result
+
+
+def current_english(english, own):
+    # В английском второго курса пока старый календарь. Берём год и недели основного.
+    if english["year"] == own["year"]:
+        return english
+    result = copy.deepcopy(english)
+    delta = own["year"] - english["year"]
+    for group in result["en"].values():
+        for row in group["rows"]:
+            for field in ["start", "end"]:
+                day = date.fromisoformat(row[field])
+                day = day.replace(year=day.year + delta)
+                row[field] = day.isoformat()
+    result["year"] = own["year"]
+    result["weeks"] = own["weeks"]
+    return result
+
+
+def lesson_order(item):
+    return item["date"], item["time"], item["text"]
+
+
+def plan(book, group, english=None, ids=()):
+    rows = []
+    for row in group["rows"]:
+        rows.append((row, book))
+    if english:
+        english = current_english(english, book)
+        for gid in ids:
+            if gid not in english["en"]:
+                raise ParseError("Выбранная группа английского исчезла. Откройте /english.")
+            for row in english["en"][gid]["rows"]:
+                rows.append((row, english))
+
+    # Считаем занятия для каждого дня модуля. Одинаковые пары не повторяем.
+    result = {}
+    for row, source in rows:
+        buildings = merge_buildings(DEFAULT_BUILDINGS, book.get("buildings", {}), source.get("buildings", {}))
+        day = date.fromisoformat(row["start"])
+        end = date.fromisoformat(row["end"])
+        if (end - day).days > 370:
+            raise ParseError("Некорректный срок модуля")
+        while day <= end:
+            for lesson in on_day(row, day, source["year"], source["weeks"]):
+                lesson = expand_building(lesson, buildings)
+                result[lesson_order(lesson)] = lesson
+            day += timedelta(days=1)
+    return sorted(result.values(), key=lesson_order)
