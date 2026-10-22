@@ -73,6 +73,11 @@ DATE_CHANGE = re.compile(
     DATE_LIST + r"\s*(?:[-–—]\s*)?(?:[вс]\s+\d{1,2}:\d{2}(?:\s*[-–—]\s*\d{1,2}:\d{2})?|"
     r"в\s+(?:ауд\.?\s*)?\d+[А-Яа-я]?(?:\s*\([^)]+\))?|online|онлайн)", re.I,
 )
+ASSESSMENT_NOTE = re.compile(
+    r"^\s*(?P<dates>" + DATE_LIST + r")\s*(?:[-–—:]\s*)?"
+    r"(?P<label>контрольная\s+работа\b|к\.?\s*р\.?(?!\w))", re.I,
+)
+ROOM_NOTE = re.compile(r"\b(?:в\s+)?ауд(?:итория)?\.?\s*:?\s*(\d+[А-Яа-я]?)", re.I)
 CODES = {
     "Филология": {"ФИЛ"},
     "Фундаментальная и прикладная лингвистика": {"ФИПЛ"},
@@ -909,7 +914,7 @@ def date_rules(text, year):
     text = CANCEL_NOTE.sub("", text)
 
     for line in text.split("\n"):
-        if date_change(line):
+        if date_change(line) and not ASSESSMENT_NOTE.match(line):
             continue
         line = TIME.sub(skip_time, line)
         marks = list(DATES.finditer(line))
@@ -954,6 +959,20 @@ def date_rules(text, year):
     return allowed, denied
 
 
+def strip_date_notes(line):
+    assessment = ASSESSMENT_NOTE.match(line)
+    if assessment:
+        line = line[:assessment.start("label")] + "Контрольная работа" + line[assessment.end("label"):]
+        line = ROOM_NOTE.sub("", line)
+    line = CANCEL_NOTE.sub("", line)
+    # Убираем смену аудитории/времени вместе с датой, сохраняя имя преподавателя.
+    line = DATE_CHANGE.sub("", line)
+    line = re.sub(r"\b(?:с|со|до|по)\s+(?=" + STAMP + ")", "", line, flags=re.I)
+    line = re.sub(DATE_LIST, "", line, flags=re.I)
+    line = re.sub(r"\(\s*\)", "", line)
+    return re.sub(r"\s+", " ", line).strip(" ,;:–—-()")
+
+
 def clean_dates(text, day, year):
     # Правила уже применены к занятию. В сообщении остаются только действующие строки.
     result = []
@@ -965,13 +984,7 @@ def clean_dates(text, day, year):
         allowed, _ = date_rules(line, year)
         if allowed is not None and day not in allowed:
             continue
-        line = CANCEL_NOTE.sub("", line)
-        # Убираем смену аудитории/времени вместе с датой, сохраняя имя преподавателя.
-        line = DATE_CHANGE.sub("", line)
-        line = re.sub(r"\b(?:с|со|до|по)\s+(?=" + STAMP + ")", "", line, flags=re.I)
-        line = re.sub(DATE_LIST, "", line, flags=re.I)
-        line = re.sub(r"\(\s*\)", "", line)
-        line = re.sub(r"\s+", " ", line).strip(" ,;:–—-()")
+        line = strip_date_notes(line)
         if line:
             result.append(line)
     return "\n".join(value for value in result if value)
@@ -1031,11 +1044,31 @@ def parts(text):
         if not block.strip():
             continue
         note = re.match(r"^\s*" + STAMP + r"\s*(?:[-–—]\s*)?(?:отмен|отм\b|в\s)", block, re.I)
-        if result and note:
+        if result and (note or ASSESSMENT_NOTE.match(date_text(block))):
             result[-1] += "\n" + block
         else:
             result.append(block.strip())
     return result
+
+
+def assessment_text(text, day, year):
+    regular, selected = [], []
+    for line in text.split("\n"):
+        note = ASSESSMENT_NOTE.match(date_text(line))
+        if note is None:
+            regular.append(line)
+        elif day in marked_days(note["dates"], year):
+            selected.append(line)
+    base = "\n".join(regular)
+    if not selected:
+        return base
+    _, denied = date_rules(base, year)
+    if day in denied:
+        return ""
+    # Контрольная наследует предмет, но имеет собственную дату, даже если
+    # обычные семинары закончились. Индекс исходного блока сохраняет его корпус.
+    context = [strip_date_notes(date_text(line)) for line in regular]
+    return "\n".join([*context, *selected])
 
 
 def on_day(row, day, year, weeks):
@@ -1069,6 +1102,9 @@ def on_day(row, day, year, weeks):
     chunks = parts(row["text"])
     result = []
     for i, text in enumerate(chunks):
+        text = assessment_text(text, day, year)
+        if not text.strip():
+            continue
         allowed, denied = date_rules(text, year)
         notes = "\n".join(row.get(field, "") for field in ["teacher", "group", "room", "place"])
         _, extra_denied = date_rules(notes, year)
@@ -1109,10 +1145,11 @@ def on_day(row, day, year, weeks):
                     duration -= int(row["time"][:2]) * 60 + int(row["time"][3:5])
                     end = int(start[:2]) * 60 + int(start[3:]) + duration
                     time = f"{start}-{end // 60:02}:{end % 60:02}"
-                new_room = re.search(r"\bв\s+(?:ауд\.?\s*)?(\d+[А-Яа-я]?)", line)
+                explicit_room = ROOM_NOTE.search(line)
+                new_room = explicit_room or re.search(r"\bв\s+(?:ауд\.?\s*)?(\d+[А-Яа-я]?)", line)
                 if not new_room:
                     new_room = re.search(STAMP + r"\s*[-–—]\s*(\d+[А-Яа-я]?)\s*\(", line)
-                if new_room and not new_time and not start_time:
+                if new_room and (explicit_room or not new_time and not start_time):
                     room = new_room[1]
                     building = re.search(r"\(([^)]+)\)", line)
                     if building:
