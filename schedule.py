@@ -18,7 +18,7 @@ import database
 
 refs = []
 source_index = {}
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 lock = asyncio.Lock()
 http = None
 DAY = {
@@ -439,6 +439,18 @@ def sheet_sections(sheet):
             for i, row in enumerate(headers)]
 
 
+def location_columns(sheet, first, last):
+    columns = {}
+    for row in sheet.iter_rows(min_row=first, max_row=last):
+        for cell in row:
+            title = re.sub(r"[\s.:№]+", "", clean(cell.value)).casefold()
+            if title in {"ауд", "аудитория", "аудитории"}:
+                columns[cell.column] = "room"
+            elif title == "корпус":
+                columns[cell.column] = "place"
+    return columns
+
+
 def read_groups(sheet, course, year, first_row=1, last_row=None):
     g = read_grid(sheet)
     layout = slots(g, first_row, last_row)
@@ -458,18 +470,16 @@ def read_groups(sheet, course, year, first_row=1, last_row=None):
                 headers.append((cell.row, cell.column, name))
     if not headers:
         raise ParseError(f"{sheet.title}: не найдены учебные группы")
+    locations = location_columns(sheet, head, first - 1)
+    group_cols = sorted({col for _, col, _ in headers})
 
     groups = {}
     for hr, col, name in headers:
         gid = key(f"{course} курс", norm(name))
         start, end = period(g, col, hr, year)
         module = module_number(above(g, hr, col, r"модул"))
-        room_col = None
-        place_col = None
-        if grid_text(g, hr, col + 1).lower().startswith("ауд"):
-            room_col = col + 1
-        if grid_text(g, hr, col + 2).lower() == "корпус":
-            place_col = col + 2
+        group_end = next((c for c in group_cols if c > col), sheet.max_column + 1)
+        own_fields = {field for c, field in locations.items() if col < c < group_end}
         group = {
             "id": gid, "name": name, "code": group_code(name),
             "course": course, "sheet": sheet.title, "rows": [], "refs": False,
@@ -483,23 +493,42 @@ def read_groups(sheet, course, year, first_row=1, last_row=None):
                 group["refs"] = True
                 continue
 
-            # У общей лекции аудитория записана после последней группы.
-            rc = room_col
-            pc = place_col
+            # Заголовки места могут быть ниже группы. У общей лекции они
+            # находятся после объединённой ячейки, у последней группы.
             area = g["merges"].get((r, col))
-            if area and (area.max_col > col or area.min_col < col):
-                if room_col and area.max_col < sheet.max_column:
-                    rc = area.max_col + 1
-                    pc = area.max_col + 2
-            room = ""
-            place = ""
-            if rc:
-                room = grid_text(g, r, rc)
-            if pc:
-                place = grid_text(g, r, pc)
+            left = area.max_col if area else col
+            right = next((c for c in group_cols if c > left), sheet.max_column + 1)
+            values = {"room": "", "place": ""}
+            cells = {}
+            for c, field in sorted(locations.items()):
+                if left < c < right and field not in cells:
+                    cells[field] = grid_cell(g, r, c)
+            if "room" in cells and "place" in cells and cells["room"] == cells["place"]:
+                # Объединённое место — одна запись: номер аудитории либо
+                # адрес/online, а не два одинаковых поля.
+                value = clean(cells["room"].value)
+                is_room = re.match(r"^\d+[А-Яа-яA-Za-z]?(?:\s*$|\s*\n|\s*\()", value) or ROOM_NOTE.search(value)
+                if is_room:
+                    del cells["place"]
+                else:
+                    del cells["room"]
+            for field, cell in cells.items():
+                values[field] = clean(cell.value)
+            if (area and area.max_col > area.min_col and not cells
+                    and "room" in own_fields and left + 1 < right):
+                # Иногда общая ячейка захватывает и столбцы аудитории
+                # и корпуса. Сразу после неё сохраняем только явный номер.
+                room = grid_text(g, r, left + 1)
+                if re.fullmatch(r"\d+[А-Яа-яA-Za-z]?", room):
+                    values["room"] = room
+                    if "place" in own_fields and left + 2 <= sheet.max_column:
+                        place = grid_text(g, r, left + 2)
+                        if (building_key(place) in DEFAULT_BUILDINGS
+                                or re.match(r"^[А-Яа-яЁё .-]+,\s*\d", place)):
+                            values["place"] = place
             group["rows"].append({
                 "day": day, "time": time, "text": text,
-                "room": room, "place": place,
+                **values,
                 "start": start, "end": end, "mode": "all",
                 "module": module,
             })

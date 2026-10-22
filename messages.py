@@ -17,6 +17,7 @@ LESSON_TYPE = re.compile(
     r"\s+[-–—]\s+(?=(?:лекци\w*|семинар\w*|практи\w*|лаборатор\w*|"
     r"консультаци\w*|зач[её]т\w*|экзамен\w*)\b)", re.I
 )
+REMOTE_LOCATION = re.compile(r"^(?:on[ -]?line|онлайн|дистанцион\w*)\b", re.I)
 
 
 def clean_title(text):
@@ -58,11 +59,21 @@ def _lesson_cells(item):
     subject = "<b>" + escape(title) + "</b>"
     if content:
         subject += "<br>" + "<br>".join(escape(line) for line in content)
+    rooms = [value for value in rooms if value and not re.fullmatch(r"[-–—\s]+", value)]
+    places = [value for value in places if value and not re.fullmatch(r"[-–—\s]+", value)]
+    remote_rooms = []
+    if any(REMOTE_LOCATION.match(value) for value in rooms):
+        remote_rooms, rooms = rooms, []
+    remote = bool(remote_rooms) or any(REMOTE_LOCATION.match(value) for value in places)
     location = []
     if rooms:
         location.append("<b>Ауд. " + escape(", ".join(rooms)) + "</b>")
-    location.extend(escape(place) for place in places)
-    return subject, "<br>".join(location) or "—"
+    elif not remote:
+        location.append("Аудитория не указана")
+    location.extend(escape(place) for place in dict.fromkeys(remote_rooms + places))
+    if not places and not remote:
+        location.append("Корпус не указан")
+    return subject, "<br>".join(location)
 
 
 def _time_order(item):
