@@ -11,7 +11,7 @@ import database
 import keyboards
 import schedule
 from schedule import ParseError, CODES, en_options, norm, plan
-from utils import valid_time, send_text, split, format_schedule, cached_plan
+from utils import valid_time, send_text, split, format_schedule, daily_schedule
 from config import MORNING, TZ
 from logger import logger
 
@@ -51,7 +51,12 @@ async def start(message: types.Message, state: FSMContext):
             logger.exception("Не удалось получить указатель")
             await message.answer("Сайт расписания сейчас недоступен. Попробуйте /start позже.")
             return
-    values = sorted({r["level"] for r in schedule.refs if not r["english"]})
+    try:
+        refs = schedule.get_catalog()
+    except ParseError as error:
+        await message.answer(str(error))
+        return
+    values = sorted({r["level"] for r in refs if not r["english"]})
     await choose(
         message,
         state,
@@ -73,13 +78,14 @@ async def show(message: types.Message, cmd=None):
     today = datetime.now(TZ).date()
     cmd = cmd or (message.text or "/today").split()[0].split("@")[0]
     offset, count = (1, 1) if cmd == "/tomorrow" else (0, 7) if cmd == "/week" else (0, 1)
-    items, name = cached_plan(user)
+    seen = {}
     for i in range(offset, offset + count):
         day = today + timedelta(days=i)
+        items, name, notice = await daily_schedule(user, day, seen)
         await send_text(
             message.bot,
             message.chat.id,
-            split(format_schedule(items, day, name, user["checked"], user["error"])),
+            split(format_schedule(items, day, name, user["checked"], user["error"], notice=notice)),
         )
 
 
@@ -89,7 +95,11 @@ async def edit_en(message: types.Message, state: FSMContext):
     if not user:
         await message.answer("Сначала выберите учебную группу: /start.")
         return
-    ref = schedule.get_program(user["program"])
+    try:
+        ref = schedule.get_program(user["program"])
+    except ParseError as error:
+        await message.answer(str(error))
+        return
     if not ref:
         await message.answer("Направление пропало из источника. Откройте /settings.")
         return
@@ -200,12 +210,12 @@ async def callback_query(callback: types.CallbackQuery, state: FSMContext, bot: 
         if step == "level":
             level = selected["value"]
             await state.update_data(level=level)
-            faculties = sorted({r["faculty"] for r in schedule.refs if r["level"] == level and not r["english"]})
+            faculties = sorted({r["faculty"] for r in schedule.get_catalog() if r["level"] == level and not r["english"]})
             await choose(message, state, "Выберите факультет.", [dict(label=v, value=v) for v in faculties], "faculty")
         elif step == "faculty":
             refs = [
                 r
-                for r in schedule.refs
+                for r in schedule.get_catalog()
                 if r["level"] == data["level"] and r["faculty"] == selected["value"] and not r["english"]
             ]
             await choose(

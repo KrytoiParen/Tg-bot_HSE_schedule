@@ -70,7 +70,7 @@ def _time_order(item):
     return (int(match[1]) * 60 + int(match[2]) if match else 1440, str(item.get("text", "")))
 
 
-def format_schedule(items, day, name, checked=None, error=None):
+def format_schedule(items, day, name, checked=None, error=None, notice=None):
     """Return an InputRichMessage-compatible dictionary for one schedule day.
 
     Dates, cancellations and room overrides must be applied by the schedule parser
@@ -81,6 +81,8 @@ def format_schedule(items, day, name, checked=None, error=None):
         f"<h3>{day:%d.%m.%Y} · {DAYS[day.weekday()]}</h3>",
     ]
     today = sorted((item for item in items if item["date"] == day.isoformat()), key=_time_order)
+    if notice:
+        blocks.append("<p>" + escape(notice) + "</p>")
     if today:
         blocks.extend([TABLE_OPEN, TABLE_HEADER])
         for item in today:
@@ -91,7 +93,7 @@ def format_schedule(items, day, name, checked=None, error=None):
                 f'<td valign="top">{subject}</td><td valign="top">{location}</td></tr>'
             )
         blocks.append("</table>")
-    else:
+    elif not notice:
         blocks.append("<p>В опубликованном расписании занятий на этот день нет.</p>")
     if error:
         blocks.append("<p>⚠️ Не удалось обновить расписание. Показана сохранённая версия; проверьте источник.</p>")
