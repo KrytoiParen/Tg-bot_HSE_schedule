@@ -104,3 +104,96 @@ async def send_text(bot, uid, texts):
             await bot.send_message(uid, text)
 
 
+async def refresh():
+    async with schedule.lock:
+        try:
+            await schedule.get_index()
+        except Exception:
+            logger.exception("Не удалось загрузить указатель")
+            for user in database.get_users():
+                database.save_error(
+                    user["id"],
+                    "Указатель расписания недоступен.",
+                    ["Не удалось проверить расписание. Сохранённая версия: /today. Повторим через час."],
+                )
+            return
+        seen = {}
+        for user in database.get_users():
+            try:
+                book, group, en = await schedule.get_data(user, fresh=True, seen=seen)
+                items = plan(book, group, en, user["en"])
+                notes = (
+                    changes(user["snapshot"], items, datetime.now(TZ).date()) if user["snapshot"] is not None else []
+                )
+                current = database.get_user(user["id"])
+                # Пока загружались таблицы, студент мог сменить группу.
+                if current and current["active"] and all(current[k] == user[k] for k in ("program", "group_id", "en")):
+                    database.save_plan(user["id"], items, notes)
+            except Exception as e:
+                logger.exception("Не удалось проверить группу %s", user["id"])
+                text = str(e) if isinstance(e, ParseError) else "Не удалось загрузить расписание."
+                database.save_error(user["id"], text, [text + " Сохранённая версия: /today. Повторим через час."])
+
+
+def morning_mail(now):
+    day = now.date()
+    for u in database.get_users():
+        hour, minute = map(int, u["morning"].split(":"))
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if not due <= now <= due + timedelta(hours=2) or u["snapshot"] is None:
+            continue
+        items, name = cached_plan(u)
+        text = format_schedule(items, day, name, u["checked"], u["error"])
+        database.add_morning(u["id"], day.isoformat(), split(text))
+
+
+async def deliver(bot):
+    global send_after
+    if time.monotonic() < send_after:
+        return min(60, send_after - time.monotonic())
+    failed = set()
+    for mail in database.get_mail():
+        uid = mail["user_id"]
+        if uid in failed:
+            continue
+        if mail["tag"].startswith("morning:") and mail["tag"][8:] != datetime.now(TZ).date().isoformat():
+            database.mark_sent(mail["id"])
+            continue
+        try:
+            await send_text(bot, uid, [mail["text"]])
+            database.mark_sent(mail["id"])
+            await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e:
+            logger.warning("Telegram ограничил отправку на %s секунд", e.retry_after)
+            send_after = time.monotonic() + e.retry_after + 1
+            return min(e.retry_after + 1, 60)
+        except TelegramForbiddenError:
+            database.stop_user(uid)
+        except TelegramBadRequest as e:
+            logger.error("Не удалось отправить сообщение %s: %s", mail["id"], e)
+            if "chat not found" in str(e).lower():
+                database.stop_user(uid)
+            else:
+                failed.add(uid)
+        except TelegramAPIError:
+            failed.add(uid)
+            logger.exception("Ошибка Telegram; сообщение осталось в очереди")
+    return 0
+
+
+async def check_schedule(bot: Bot):
+    next_check = 0
+    while True:
+        try:
+            if time.monotonic() >= next_check:
+                # Проверка раз в час; длительная загрузка не создаёт вторую копию задания.
+                next_check = time.monotonic() + 3600
+                await refresh()
+            morning_mail(datetime.now(TZ))
+            delay = await deliver(bot)
+            await asyncio.sleep(max(15, delay))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка фоновой задачи; повтор через минуту")
+            await asyncio.sleep(60)
