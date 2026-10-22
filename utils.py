@@ -34,25 +34,56 @@ def lesson(item):
     return item["time"] + "\n" + item["text"]
 
 
-def cached_plan(user):
-    ref = schedule.get_program(user["program"])
+def cached_plan(user, day=None):
+    day = day or datetime.now(TZ).date()
+    ref = schedule.get_program(user["program"], day)
     book = database.get_cache("book:" + ref["book"]) if ref else None
     group = book["groups"].get(user["group_id"]) if book else None
     name = group["name"] if group else "Ваша группа"
     saved = schedule.expand_plan_buildings([clean_item(v) for v in user["snapshot"] or []])
     if not group:
+        if schedule.source_index:
+            raise schedule.SourceUnavailable("Расписание выбранного модуля ещё не загружено. Повторите запрос позже.")
         return saved, name
+    schedule.validate_schedule(book, group, day)
     english = None
     if user["en"]:
-        ref = schedule.get_english(group["course"])
+        ref = schedule.get_english(group["course"], day)
         english = database.get_cache("en:" + ref["book"]) if ref else None
         if not english:
+            if schedule.source_index:
+                raise schedule.SourceUnavailable("Расписание английского для выбранного модуля ещё не загружено. Повторите запрос позже.")
             return saved, name
+        schedule.validate_english(english, book, user["en"], day)
     try:
         # Пересчитываем сохранённые таблицы, чтобы старые подписки получили новый вид сразу.
         return plan(book, group, english, user["en"]), name
     except ParseError:
+        if schedule.source_index:
+            raise
         return saved, name
+
+
+async def daily_schedule(user, day, seen=None):
+    notice = schedule.source_notice(day)
+    if notice:
+        return [], "Ваша группа", notice
+    try:
+        if schedule.source_index:
+            async with schedule.lock:
+                book, group, english = await schedule.get_data(user, day=day, seen=seen)
+            return plan(book, group, english, user["en"]), group["name"], None
+        items, name = cached_plan(user, day)
+        return items, name, None
+    except schedule.SourceUnavailable as error:
+        return [], "Ваша группа", str(error)
+    except Exception:
+        logger.exception("Не удалось получить расписание на %s", day)
+        try:
+            items, name = cached_plan(user, day)
+            return items, name, "Источник временно недоступен. Показана сохранённая версия расписания."
+        except ParseError as error:
+            return [], "Ваша группа", str(error)
 
 
 def clean_item(item):
@@ -142,8 +173,14 @@ def morning_mail(now):
         due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if not due <= now <= due + timedelta(hours=2) or u["snapshot"] is None:
             continue
-        items, name = cached_plan(u)
-        text = format_schedule(items, day, name, u["checked"], u["error"])
+        notice = schedule.source_notice(day)
+        items, name = [], "Ваша группа"
+        if not notice:
+            try:
+                items, name = cached_plan(u, day)
+            except ParseError as error:
+                notice = str(error)
+        text = format_schedule(items, day, name, u["checked"], u["error"], notice=notice)
         database.add_morning(u["id"], day.isoformat(), split(text))
 
 

@@ -4,18 +4,21 @@ import hashlib
 import io
 import re
 import ssl
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import aiohttp
 import certifi
 import pdfplumber
 from openpyxl import load_workbook
 
-from config import PDF_URL
+from config import SCHEDULE_URL, TZ
 from logger import logger
+from sources import ParseError, SourceUnavailable, discover_modules, module_number
 import database
 
 refs = []
+source_index = {}
+PARSER_VERSION = 2
 lock = asyncio.Lock()
 http = None
 DAY = {
@@ -81,7 +84,7 @@ ROOM_NOTE = re.compile(r"\b(?:в\s+)?ауд(?:итория)?\.?\s*:?\s*(\d+[А-�
 CODES = {
     "Филология": {"ФИЛ"},
     "Фундаментальная и прикладная лингвистика": {"ФИПЛ"},
-    "Математика": {"МТ", "МАГМТ"},
+    "Математика": {"МТ", "МАГМТ", "ФПМ", "ФМ"},
     "Фундаментальная и прикладная математика": {"ФПМ", "ФМ"},
     "Дизайн": {"НДИЗ", "ДИЗ"},
     "Компьютерные науки и технологии": {"КНТ"},
@@ -95,13 +98,10 @@ CODES = {
 }
 
 
-class ParseError(ValueError):
-    pass
-
-
 async def open_sources():
-    global http, refs
-    refs = database.get_cache("catalog") or []
+    global http, refs, source_index
+    source_index = database.get_cache("source-index:v1") or {}
+    refs = (database.get_cache("catalog") or []) if source_index else []
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx), timeout=aiohttp.ClientTimeout(total=60))
 
@@ -112,9 +112,7 @@ async def close_sources():
 
 
 async def download(url, kind):
-    header = b"PK"
-    if kind == "pdf":
-        header = b"%PDF"
+    headers = {"xlsx": (b"PK",), "pdf": (b"%PDF",), "html": (b"<!doctype html", b"<html")}
     for attempt in range(3):
         try:
             async with http.get(url) as reply:
@@ -122,7 +120,7 @@ async def download(url, kind):
                 data = await reply.read()
             if len(data) > 20_000_000:
                 raise ParseError("Слишком большой файл")
-            if not data.startswith(header):
+            if not data.lstrip().lower().startswith(tuple(value.lower() for value in headers[kind])):
                 raise ParseError("Сайт вернул страницу вместо расписания")
             return data
         except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -132,11 +130,85 @@ async def download(url, kind):
 
 
 async def get_index():
-    global refs
-    data = await download(PDF_URL, "pdf")
-    rows = await asyncio.to_thread(catalog, data)
-    database.save_cache("catalog", rows)
-    refs = rows
+    global refs, source_index
+    html = (await download(SCHEDULE_URL, "html")).decode("utf-8")
+    modules = discover_modules(html, SCHEDULE_URL)
+    rows, parsed = [], {}
+    for number, item in modules.items():
+        if not item["url"]:
+            continue
+        try:
+            if item["url"] not in parsed:
+                parsed[item["url"]] = await asyncio.to_thread(catalog, await download(item["url"], "pdf"))
+            item["refs"] = parsed[item["url"]]
+            rows.extend(item["refs"])
+        except Exception:
+            logger.exception("Не удалось загрузить PDF модуля %s", number)
+            item["error"] = f"Не удалось загрузить PDF расписания модуля {number}. Повторим проверку позже."
+    # Календарь из официальной XLSX содержит даты всех четырёх модулей,
+    # сессий и каникул, даже когда PDF следующих модулей ещё не опубликованы.
+    calendar_book = None
+    for ref in rows:
+        if ref["english"]:
+            continue
+        try:
+            candidate = await get_book(ref["book"], fresh=True)
+            if {info["module"] for info in candidate.get("calendar_days", {}).values()} == {1, 2, 3, 4} \
+                    and candidate["year"] == academic_year(datetime.now(TZ).date()):
+                calendar_book = candidate
+                break
+        except Exception:
+            logger.exception("Не удалось прочитать учебный календарь из %s", ref["name"])
+    if calendar_book is None:
+        raise ParseError("Не удалось получить официальный календарь текущего учебного года")
+    index = {"year": calendar_book["year"], "days": calendar_book["calendar_days"], "modules": modules}
+    database.save_cache("source-index:v1", index)
+    # Стабильные id направлений сохраняют подписки при смене PDF/модуля.
+    refs = list({item["id"]: item for item in rows}.values())
+    database.save_cache("catalog", refs)
+    source_index = index
+
+
+def academic_year(day):
+    return day.year if day.month >= 9 else day.year - 1
+
+
+def calendar_day(day):
+    if not source_index:
+        return None
+    info = source_index.get("days", {}).get(day.isoformat())
+    if source_index.get("year") != academic_year(day) or info is None:
+        raise SourceUnavailable(f"Для {day:%d.%m.%Y} ещё нет актуального учебного календаря. Расписание не подтверждено.")
+    return info
+
+
+def get_catalog(day=None):
+    day = day or datetime.now(TZ).date()
+    info = calendar_day(day)
+    if info is None:
+        if not refs:
+            raise SourceUnavailable("Источники расписания ещё не проверены. Повторите запрос после обновления.")
+        return refs
+    number = info["module"]
+    item = source_index.get("modules", {}).get(str(number), {})
+    if item.get("error"):
+        raise SourceUnavailable(item["error"])
+    if not item.get("url") or not item.get("refs"):
+        raise SourceUnavailable(f"Расписание очного обучения для модуля {number} ещё не опубликовано на сайте ВШЭ.")
+    return item["refs"]
+
+
+def source_notice(day):
+    try:
+        info = calendar_day(day)
+        if info and info["kind"] == "session":
+            return "По учебному календарю идёт сессия. Расписание экзаменов публикуется отдельно от учебных занятий."
+        if info and info["kind"] == "vacation":
+            return "По учебному календарю каникулы."
+        get_catalog(day)
+    except SourceUnavailable as error:
+        return str(error)
+    return None
 
 
 async def get_book(bid, english=False, fresh=False):
@@ -145,7 +217,7 @@ async def get_book(bid, english=False, fresh=False):
         cache_key = "en:" + bid
     if not fresh:
         saved = database.get_cache(cache_key)
-        if saved:
+        if saved and saved.get("parser_version") == PARSER_VERSION:
             return saved
     url = f"https://docs.google.com/spreadsheets/d/{bid}/export?format=xlsx"
     data = await download(url, "xlsx")
@@ -154,15 +226,15 @@ async def get_book(bid, english=False, fresh=False):
     return book
 
 
-def get_program(pid):
-    for item in refs:
+def get_program(pid, day=None):
+    for item in get_catalog(day):
         if item["id"] == pid:
             return item
     return None
 
 
-def get_english(course):
-    for item in refs:
+def get_english(course, day=None):
+    for item in get_catalog(day):
         if item["english"] and item["name"] == f"{course} курс":
             return item
     return None
@@ -182,30 +254,58 @@ async def read_once(bid, english, fresh, seen):
     return result
 
 
-async def get_data(user, fresh=False, seen=None):
+async def get_data(user, fresh=False, seen=None, day=None):
     if seen is None:
         seen = {}
-    ref = get_program(user["program"])
+    day = day or datetime.now(TZ).date()
+    ref = get_program(user["program"], day)
     if not ref:
         raise ParseError("Направление пропало из указателя. Откройте /settings.")
     book = await read_once(ref["book"], False, fresh, seen)
     group = book["groups"].get(user["group_id"])
     if not group:
         raise ParseError("Учебная группа пропала из таблицы. Откройте /settings.")
+    validate_schedule(book, group, day)
 
     en = None
     if user["en"]:
-        ref = get_english(group["course"])
+        ref = get_english(group["course"], day)
         if not ref:
             raise ParseError("Не найдено расписание английского. Откройте /english.")
         en = await read_once(ref["book"], True, fresh, seen)
+        validate_english(en, book, user["en"], day)
     return book, group, en
+
+
+def validate_schedule(book, group, day):
+    info = calendar_day(day)
+    periods = group.get("periods") or group["rows"]
+    if info and (book["year"] != academic_year(day) or info["kind"] == "classes" and not any(
+            row.get("module") == info["module"] and row["start"] <= row["end"]
+            and academic_year(date.fromisoformat(row["start"])) == book["year"]
+            for row in periods)):
+        raise SourceUnavailable(f"Таблица группы ещё не содержит расписание на {day:%d.%m.%Y}. Дождитесь публикации источника.")
+
+
+def validate_english(english, own, ids, day):
+    if not source_index:
+        return
+    aligned = current_english(english, own)
+    for gid in ids:
+        group = aligned["en"].get(gid)
+        if group is None:
+            raise ParseError("Выбранная группа английского исчезла. Откройте /english.")
+        try:
+            validate_schedule(aligned, group, day)
+        except SourceUnavailable:
+            raise SourceUnavailable(f"Таблица английского ещё не содержит расписание на {day:%d.%m.%Y}.") from None
 
 
 async def check_sources():
     await get_index()
     books = {}
-    for ref in refs:
+    all_refs = [ref for item in source_index.get("modules", {}).values() for ref in item.get("refs", [])] if source_index else refs
+    for ref in all_refs:
         books[ref["book"]] = ref
     for bid, ref in books.items():
         book = await get_book(bid, ref["english"], fresh=True)
@@ -224,7 +324,7 @@ async def check_sources():
 def parse_book(data, english=False):
     book = load_workbook(io.BytesIO(data), data_only=True)
     try:
-        year, weeks = calendar(book)
+        year, weeks, calendar_days = calendar(book, details=True)
         buildings = read_buildings(book)
         if not english and "Расписание" in book.sheetnames:
             # У дизайна все курсы на одном листе.
@@ -233,19 +333,21 @@ def parse_book(data, english=False):
                     if re.search(r"гр\.\s*\d{2}ндиз", clean(cell.value), re.I):
                         result = parse_design(book, year, weeks)
                         result["buildings"] = buildings
+                        result.update(calendar_days=calendar_days, parser_version=PARSER_VERSION)
                         return result
 
         groups = {}
         en = {}
         for sheet in book:
-            match = re.fullmatch(r"(\d)\s*курс", sheet.title, re.I)
+            match = re.fullmatch(r"(\d)\s*курс(?:\s+.*)?", sheet.title.strip(), re.I)
             if not match or sheet.sheet_state != "visible":
                 continue
             course = int(match[1])
-            if english:
-                en.update(read_english(sheet, course, year))
-            else:
-                groups.update(read_groups(sheet, course, year))
+            for first, last in sheet_sections(sheet):
+                if english:
+                    merge_groups(en, read_english(sheet, course, year, first, last))
+                else:
+                    merge_groups(groups, read_groups(sheet, course, year, first, last))
         if (english and not en) or (not english and not groups):
             raise ParseError("Не найдено ни одной группы")
         if not english:
@@ -256,7 +358,8 @@ def parse_book(data, english=False):
                     break
             if not has_lessons:
                 raise ParseError("Таблица содержит группы, но не содержит занятий")
-        return {"year": year, "weeks": weeks, "groups": groups, "en": en, "buildings": buildings}
+        return {"year": year, "weeks": weeks, "groups": groups, "en": en, "buildings": buildings,
+                "calendar_days": calendar_days, "parser_version": PARSER_VERSION}
     finally:
         book.close()
 
@@ -309,9 +412,36 @@ def catalog(data):
     return result
 
 
-def read_groups(sheet, course, year):
+def merge_groups(target, added):
+    for gid, group in added.items():
+        if gid not in target:
+            target[gid] = group
+            continue
+        target[gid]["rows"].extend(group["rows"])
+        if group.get("periods"):
+            target[gid].setdefault("periods", []).extend(group["periods"])
+        if "refs" in group:
+            target[gid]["refs"] |= group["refs"]
+        for teacher in group.get("teachers", []):
+            if teacher not in target[gid]["teachers"]:
+                target[gid]["teachers"].append(teacher)
+
+
+def sheet_sections(sheet):
+    headers = []
+    for row in sheet:
+        values = {clean(cell.value).casefold() for cell in row}
+        if {"день", "время"} <= values:
+            headers.append(row[0].row)
+    if not headers:
+        return [(1, sheet.max_row)]
+    return [(1 if i == 0 else row, headers[i + 1] - 1 if i + 1 < len(headers) else sheet.max_row)
+            for i, row in enumerate(headers)]
+
+
+def read_groups(sheet, course, year, first_row=1, last_row=None):
     g = read_grid(sheet)
-    layout = slots(g)
+    layout = slots(g, first_row, last_row)
     if layout is None:
         raise ParseError(f"{sheet.title}: отсутствуют День/Время")
     head, rows = layout
@@ -331,8 +461,9 @@ def read_groups(sheet, course, year):
 
     groups = {}
     for hr, col, name in headers:
-        gid = key(sheet.title, norm(name))
+        gid = key(f"{course} курс", norm(name))
         start, end = period(g, col, hr, year)
+        module = module_number(above(g, hr, col, r"модул"))
         room_col = None
         place_col = None
         if grid_text(g, hr, col + 1).lower().startswith("ауд"):
@@ -342,6 +473,7 @@ def read_groups(sheet, course, year):
         group = {
             "id": gid, "name": name, "code": group_code(name),
             "course": course, "sheet": sheet.title, "rows": [], "refs": False,
+            "periods": [{"start": start, "end": end, "module": module}],
         }
         for r, day, time in rows:
             text = grid_text(g, r, col)
@@ -369,14 +501,15 @@ def read_groups(sheet, course, year):
                 "day": day, "time": time, "text": text,
                 "room": room, "place": place,
                 "start": start, "end": end, "mode": "all",
+                "module": module,
             })
-        groups[gid] = group
+        merge_groups(groups, {gid: group})
     return groups
 
 
-def read_english(sheet, course, year):
+def read_english(sheet, course, year, first_row=1, last_row=None):
     g = read_grid(sheet)
-    layout = slots(g)
+    layout = slots(g, first_row, last_row)
     if layout is None:
         raise ParseError(f"{sheet.title}: отсутствуют День/Время")
     head, rows = layout
@@ -385,7 +518,7 @@ def read_english(sheet, course, year):
         first = rows[0][0]
 
     headers = []
-    for row in sheet.iter_rows(max_row=first - 1):
+    for row in sheet.iter_rows(min_row=first_row, max_row=first - 1):
         for cell in row:
             if clean(cell.value).lower() == "группа":
                 headers.append((cell.row, cell.column))
@@ -400,6 +533,7 @@ def read_english(sheet, course, year):
         elif "НИЖНЯЯ" in title:
             mode = "lower"
         start, end = period(g, col, hr, year)
+        module = module_number(above(g, hr, col, r"модул"))
         with_subject = grid_text(g, hr, col - 1).lower() == "дисциплина"
 
         for r, day, time in rows:
@@ -425,7 +559,7 @@ def read_english(sheet, course, year):
                     kind = group
 
                 # Один номер бывает у разных направлений и уровней.
-                gid = key(sheet.title, faculty, str(num), code, level, mode, kind)
+                gid = key(f"{course} курс", faculty, str(num), code, level, mode, kind)
                 if gid not in groups:
                     groups[gid] = {
                         "id": gid, "num": num, "code": code, "level": level,
@@ -440,6 +574,7 @@ def read_english(sheet, course, year):
                     "day": day, "time": time, "text": subject,
                     "teacher": teacher, "group": group, "room": room, "place": place,
                     "start": start, "end": end, "mode": mode,
+                    "module": module,
                 })
     return groups
 
@@ -461,11 +596,13 @@ def parse_design(book, year, weeks):
             meta = read_grid(book[f"{course} курс"])
             head, _ = slots(meta)
             start, end = period(meta, 5, head, year)
+            module = module_number(above(meta, head, 5, r"модул"))
             name = match[1].upper()
             gid = key(f"{course} курс", norm(name))
             group = {
                 "id": gid, "name": name, "code": "НДИЗ", "course": course,
                 "sheet": sheet.title, "rows": [], "refs": False, "note": clean(cell.value),
+                "periods": [{"start": start, "end": end, "module": module}],
             }
             time_col = None
             for c in range(col - 1, 0, -1):
@@ -495,6 +632,7 @@ def parse_design(book, year, weeks):
                 group["rows"].append({
                     "day": day, "time": time, "text": text, "room": room, "place": "",
                     "start": start, "end": end, "mode": "all",
+                    "module": module,
                 })
             groups[gid] = group
     if not groups:
@@ -646,7 +784,7 @@ def color(cell):
     return ""
 
 
-def calendar(book):
+def calendar(book, details=False):
     sheet = None
     for s in book:
         if "календар" in s.title.lower():
@@ -671,8 +809,16 @@ def calendar(book):
 
     g = read_grid(sheet)
     weeks = {}
+    days = {}
+    module = None
+    phases = {clean(cell.value).casefold(): color(cell) for row in sheet for cell in row
+              if clean(cell.value).casefold() in {"сессия", "каникулы"}}
     month_row = None
     for row in sheet:
+        for cell in row:
+            number = module_number(clean(cell.value))
+            if number:
+                module = number
         has_month = False
         for cell in row:
             if clean(cell.value).lower() in MONTH:
@@ -712,7 +858,18 @@ def calendar(book):
             if upper and color(cell) == upper:
                 mode = "upper"
             weeks[day.isoformat()] = mode
-    return year, weeks
+            if module:
+                kind = "classes"
+                if phases.get("сессия") and color(cell) == phases["сессия"]:
+                    kind = "session"
+                elif phases.get("каникулы") and color(cell) == phases["каникулы"]:
+                    kind = "vacation"
+                stamp = day.isoformat()
+                info = {"module": module, "kind": kind}
+                if stamp in days and days[stamp] != info:
+                    raise ParseError(f"Противоречивые модули в календаре на {day}")
+                days[stamp] = info
+    return (year, weeks, days) if details else (year, weeks)
 
 
 def as_date(text, year):
@@ -736,11 +893,12 @@ def period(g, col, row, year):
     return start.isoformat(), end.isoformat()
 
 
-def slots(g):
+def slots(g, first_row=1, last_row=None):
     day_col = None
     time_col = None
     head = None
-    for row in g["sheet"]:
+    last_row = last_row or g["sheet"].max_row
+    for row in g["sheet"].iter_rows(min_row=first_row, max_row=last_row):
         for cell in row:
             text = clean(cell.value).lower()
             if text == "день":
@@ -755,7 +913,7 @@ def slots(g):
 
     result = []
     day = None
-    for r in range(head + 1, g["sheet"].max_row + 1):
+    for r in range(head + 1, last_row + 1):
         text = grid_text(g, r, day_col).split("\n")[0].lower().rstrip(".")
         if text in DAY:
             day = DAY[text]
@@ -1071,8 +1229,10 @@ def assessment_text(text, day, year):
     return "\n".join([*context, *selected])
 
 
-def on_day(row, day, year, weeks):
+def on_day(row, day, year, weeks, module=None):
     stamp = day.isoformat()
+    if module is not None and row.get("module") is not None and row["module"] != module:
+        return []
     if day.weekday() != row["day"]:
         return []
     if not row["start"] <= stamp <= row["end"]:
@@ -1085,15 +1245,9 @@ def on_day(row, day, year, weeks):
 
     match = re.search(r"со?\s+(\d)\s*модул", row["text"], re.I)
     if match:
-        month = date.fromisoformat(row["start"]).month
-        if 9 <= month <= 10:
-            current = 1
-        elif month >= 11:
-            current = 2
-        elif month <= 3:
-            current = 3
-        else:
-            current = 4
+        current = row.get("module")
+        if current is None:
+            raise ParseError("В источнике не указан модуль занятия. Обновите таблицу расписания.")
         if int(match[1]) > current:
             return []
     if re.search(r"нечетным\s+недел", row["text"], re.I) and weeks.get(stamp) != "lower":
@@ -1208,6 +1362,7 @@ def current_english(english, own):
                 row[field] = day.isoformat()
     result["year"] = own["year"]
     result["weeks"] = own["weeks"]
+    result["calendar_days"] = own.get("calendar_days", {})
     return result
 
 
@@ -1236,7 +1391,8 @@ def plan(book, group, english=None, ids=()):
         if (end - day).days > 370:
             raise ParseError("Некорректный срок модуля")
         while day <= end:
-            for lesson in on_day(row, day, source["year"], source["weeks"]):
+            module = source.get("calendar_days", {}).get(day.isoformat(), {}).get("module")
+            for lesson in on_day(row, day, source["year"], source["weeks"], module=module):
                 lesson = expand_building(lesson, buildings)
                 result[lesson_order(lesson)] = lesson
             day += timedelta(days=1)
