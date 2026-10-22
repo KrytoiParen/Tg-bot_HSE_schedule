@@ -94,6 +94,128 @@ class ParseError(ValueError):
     pass
 
 
+async def open_sources():
+    global http, refs
+    refs = database.get_cache("catalog") or []
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx), timeout=aiohttp.ClientTimeout(total=60))
+
+
+async def close_sources():
+    if http:
+        await http.close()
+
+
+async def download(url, kind):
+    header = b"PK"
+    if kind == "pdf":
+        header = b"%PDF"
+    for attempt in range(3):
+        try:
+            async with http.get(url) as reply:
+                reply.raise_for_status()
+                data = await reply.read()
+            if len(data) > 20_000_000:
+                raise ParseError("Слишком большой файл")
+            if not data.startswith(header):
+                raise ParseError("Сайт вернул страницу вместо расписания")
+            return data
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 ** attempt)
+
+
+async def get_index():
+    global refs
+    data = await download(PDF_URL, "pdf")
+    rows = await asyncio.to_thread(catalog, data)
+    database.save_cache("catalog", rows)
+    refs = rows
+
+
+async def get_book(bid, english=False, fresh=False):
+    cache_key = "book:" + bid
+    if english:
+        cache_key = "en:" + bid
+    if not fresh:
+        saved = database.get_cache(cache_key)
+        if saved:
+            return saved
+    url = f"https://docs.google.com/spreadsheets/d/{bid}/export?format=xlsx"
+    data = await download(url, "xlsx")
+    book = await asyncio.to_thread(parse_book, data, english)
+    database.save_cache(cache_key, book)
+    return book
+
+
+def get_program(pid):
+    for item in refs:
+        if item["id"] == pid:
+            return item
+    return None
+
+
+def get_english(course):
+    for item in refs:
+        if item["english"] and item["name"] == f"{course} курс":
+            return item
+    return None
+
+
+async def read_once(bid, english, fresh, seen):
+    # За одну проверку общую таблицу скачиваем один раз.
+    name = (bid, english)
+    if name not in seen:
+        try:
+            seen[name] = await get_book(bid, english, fresh=fresh)
+        except Exception as e:
+            seen[name] = e
+    result = seen[name]
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+async def get_data(user, fresh=False, seen=None):
+    if seen is None:
+        seen = {}
+    ref = get_program(user["program"])
+    if not ref:
+        raise ParseError("Направление пропало из указателя. Откройте /settings.")
+    book = await read_once(ref["book"], False, fresh, seen)
+    group = book["groups"].get(user["group_id"])
+    if not group:
+        raise ParseError("Учебная группа пропала из таблицы. Откройте /settings.")
+
+    en = None
+    if user["en"]:
+        ref = get_english(group["course"])
+        if not ref:
+            raise ParseError("Не найдено расписание английского. Откройте /english.")
+        en = await read_once(ref["book"], True, fresh, seen)
+    return book, group, en
+
+
+async def check_sources():
+    await get_index()
+    books = {}
+    for ref in refs:
+        books[ref["book"]] = ref
+    for bid, ref in books.items():
+        book = await get_book(bid, ref["english"], fresh=True)
+        groups = book["groups"]
+        if ref["english"]:
+            groups = book["en"]
+        for group in groups.values():
+            if ref["english"]:
+                plan(book, {"rows": []}, book, [group["id"]])
+            else:
+                plan(book, group)
+        print(f"OK: {ref['name']} — {len(groups)} групп")
+    print(f"Проверено таблиц: {len(books)}")
+
+
 def parse_book(data, english=False):
     book = load_workbook(io.BytesIO(data), data_only=True)
     try:
