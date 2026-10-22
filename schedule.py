@@ -93,8 +93,9 @@ CODES = {
     "Международный бакалавриат по бизнесу и экономике": {"МПБЭ", "МББЭ"},
     "Цифровой маркетинг": {"ЦМ"},
     "Юриспруденция": {"Ю"},
-    "Правовое обеспечение и защита бизнеса": {"ПОЗБ"},
-    "Управление правовыми рисками в бизнесе": {"УПРБ"},
+    # Оба названия в каталоге ведут в общую таблицу магистратуры по праву.
+    "Правовое обеспечение и защита бизнеса": {"ПОЗБ", "УПРБ", "ЮМ"},
+    "Управление правовыми рисками в бизнесе": {"ПОЗБ", "УПРБ", "ЮМ"},
 }
 
 
@@ -240,6 +241,11 @@ def get_english(course, day=None):
     return None
 
 
+def program_groups(book, program):
+    codes = CODES.get(program["name"])
+    return [group for group in book["groups"].values() if not codes or group["code"] in codes]
+
+
 async def read_once(bid, english, fresh, seen):
     # За одну проверку общую таблицу скачиваем один раз.
     name = (bid, english)
@@ -303,12 +309,13 @@ def validate_english(english, own, ids, day):
 
 async def check_sources():
     await get_index()
-    books = {}
+    books, parsed = {}, {}
     all_refs = [ref for item in source_index.get("modules", {}).values() for ref in item.get("refs", [])] if source_index else refs
     for ref in all_refs:
         books[ref["book"]] = ref
     for bid, ref in books.items():
         book = await get_book(bid, ref["english"], fresh=True)
+        parsed[bid] = book
         groups = book["groups"]
         if ref["english"]:
             groups = book["en"]
@@ -318,6 +325,9 @@ async def check_sources():
             else:
                 plan(book, group)
         print(f"OK: {ref['name']} — {len(groups)} групп")
+    for ref in all_refs:
+        if not ref["english"] and not program_groups(parsed[ref["book"]], ref):
+            raise ParseError(f"{ref['name']}: в таблице нет групп выбранного направления")
     print(f"Проверено таблиц: {len(books)}")
 
 

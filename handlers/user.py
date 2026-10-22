@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 import database
 import keyboards
 import schedule
-from schedule import ParseError, CODES, en_options, norm, plan
+from schedule import ParseError, en_options, norm, plan
 from utils import valid_time, send_text, split, format_schedule, daily_schedule
 from config import MORNING, TZ
 from logger import logger
@@ -225,8 +225,7 @@ async def callback_query(callback: types.CallbackQuery, state: FSMContext, bot: 
             ref = schedule.get_program(selected["value"])
             async with schedule.lock:
                 book = await schedule.get_book(ref["book"], fresh=True)
-            codes = CODES.get(ref["name"])
-            groups = [g for g in book["groups"].values() if not codes or g["code"] in codes]
+            groups = schedule.program_groups(book, ref)
             if not groups:
                 raise ParseError("В таблице нет групп выбранного направления")
             await state.update_data(program=ref["id"], groups=groups)
